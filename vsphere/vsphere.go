@@ -3,9 +3,10 @@ package vsphere
 import (
 	"context"
 	"fmt"
+	"io"
 	"path"
-	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/libopenstorage/cloudops"
@@ -15,9 +16,12 @@ import (
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/property"
+	"github.com/vmware/govmomi/units"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/mo"
+	"github.com/vmware/govmomi/vim25/progress"
 	"github.com/vmware/govmomi/vim25/types"
+	"github.com/vmware/govmomi/vslm"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/cloudprovider/providers/vsphere/vclib"
 	"k8s.io/kubernetes/pkg/cloudprovider/providers/vsphere/vclib/diskmanagers"
@@ -145,39 +149,45 @@ func (ops *vsphereOps) Create(opts interface{}, labels map[string]string) (inter
 	}
 
 	volumeOptions.Datastore = datastore
-
-	diskBasePath := filepath.Clean(ds.Path(diskDirectory)) + "/"
-	err = ds.CreateDirectory(ctx, diskBasePath, false)
-	if err != nil && err != vclib.ErrFileAlreadyExist {
-		logrus.Errorf("Cannot create dir %#v. err %s", diskBasePath, err)
-		return nil, err
+	trueVar := true
+	m := vslm.NewObjectManager(vmObj.Client())
+	spec := types.VslmCreateSpec{
+		Name:              volumeOptions.Name,
+		CapacityInMB:      int64(volumeOptions.CapacityKB*1024) / units.MB,
+		KeepAfterDeleteVm: &trueVar,
+		BackingSpec: &types.VslmCreateSpecDiskFileBackingSpec{
+			VslmCreateSpecBackingSpec: types.VslmCreateSpecBackingSpec{
+				Datastore: ds.Reference(),
+			},
+			ProvisioningType: string(types.BaseConfigInfoDiskFileBackingInfoProvisioningTypeThin),
+		},
 	}
 
-	diskPath := diskBasePath + volumeOptions.Name + ".vmdk"
-	disk := diskmanagers.VirtualDisk{
-		DiskPath:      diskPath,
-		VolumeOptions: volumeOptions,
-	}
-
-	diskPath, err = disk.Create(ctx, ds)
+	task, err := m.CreateDisk(ctx, spec)
 	if err != nil {
-		logrus.Errorf("Failed to create a vsphere volume with volumeOptions: %+v on "+
-			"datastore: %s. err: %+v", volumeOptions, datastore, err)
 		return nil, err
 	}
 
-	// Get the canonical path for the volume path.
-	canonicalVolumePath, err := getCanonicalVolumePath(ctx, vmObj.Datacenter, diskPath)
+	logger := newProgressLogger(fmt.Sprintf("Creating %s...", spec.Name))
+	res, err := task.WaitForResult(ctx, logger)
+	logger.Wait()
 	if err != nil {
-		logrus.Errorf("Failed to get canonical vsphere disk path for: %s with "+
-			"volumeOptions: %+v on datastore: %s. err: %+v", diskPath, volumeOptions, datastore, err)
 		return nil, err
 	}
 
-	disk.DiskPath = canonicalVolumePath
+	myDisk := res.Result.(types.VStorageObject)
+	logrus.Infof(myDisk.Config.Id.Id)
+
+	fileInfo, ok := myDisk.Config.Backing.(*types.BaseConfigInfoDiskFileBackingInfo)
+	if !ok {
+		return nil, fmt.Errorf("failed to get disk file path: %v", myDisk)
+	}
 
 	return &VirtualDisk{
-		VirtualDisk:  disk,
+		VirtualDisk: diskmanagers.VirtualDisk{
+			VolumeOptions: volumeOptions,
+			DiskPath:      fileInfo.FilePath,
+		},
 		DatastoreRef: ds.Reference(),
 	}, nil
 }
@@ -731,4 +741,135 @@ func isExponentialError(err error) bool {
 		}
 	}
 	return false
+}
+
+type progressLogger struct {
+	prefix string
+
+	wg sync.WaitGroup
+
+	sink chan chan progress.Report
+	done chan struct{}
+}
+
+func newProgressLogger(prefix string) *progressLogger {
+	p := &progressLogger{
+		prefix: prefix,
+
+		sink: make(chan chan progress.Report),
+		done: make(chan struct{}),
+	}
+
+	p.wg.Add(1)
+
+	go p.loopA()
+
+	return p
+}
+
+func createProgressLogger(prefix string) *progressLogger {
+	return newProgressLogger(prefix)
+}
+
+type OutputFlag struct {
+	common
+
+	JSON bool
+	XML  bool
+	TTY  bool
+	Dump bool
+	Out  io.Writer
+
+	formatError  bool
+	formatIndent bool
+}
+
+// Type to help flags out with only registering/processing once.
+type common struct {
+	register sync.Once
+	process  sync.Once
+}
+
+func (c *common) RegisterOnce(fn func()) {
+	c.register.Do(fn)
+}
+
+func (c *common) ProcessOnce(fn func() error) (err error) {
+	c.process.Do(func() {
+		err = fn()
+	})
+	return err
+}
+
+// loopA runs before Sink() has been called.
+func (p *progressLogger) loopA() {
+	var err error
+
+	defer p.wg.Done()
+
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+
+	called := false
+
+	for stop := false; !stop; {
+		select {
+		case ch := <-p.sink:
+			err = p.loopB(tick, ch)
+			stop = true
+			called = true
+		case <-p.done:
+			stop = true
+		case <-tick.C:
+			line := fmt.Sprintf("\r%s", p.prefix)
+			logrus.Infof(line)
+		}
+	}
+
+	if err != nil && err != io.EOF {
+		logrus.Error(fmt.Sprintf("\r%sError: %s\n", p.prefix, err))
+	} else if called {
+		logrus.Infof(fmt.Sprintf("\r%sOK\n", p.prefix))
+	}
+}
+
+// loopA runs after Sink() has been called.
+func (p *progressLogger) loopB(tick *time.Ticker, ch <-chan progress.Report) error {
+	var r progress.Report
+	var ok bool
+	var err error
+
+	for ok = true; ok; {
+		select {
+		case r, ok = <-ch:
+			if !ok {
+				break
+			}
+			err = r.Error()
+		case <-tick.C:
+			line := fmt.Sprintf("\r%s", p.prefix)
+			if r != nil {
+				line += fmt.Sprintf("(%.0f%%", r.Percentage())
+				detail := r.Detail()
+				if detail != "" {
+					line += fmt.Sprintf(", %s", detail)
+				}
+				line += ")"
+			}
+			logrus.Infof(line)
+		}
+	}
+
+	return err
+}
+
+func (p *progressLogger) Sink() chan<- progress.Report {
+	ch := make(chan progress.Report)
+	p.sink <- ch
+	return ch
+}
+
+func (p *progressLogger) Wait() {
+	close(p.done)
+	p.wg.Wait()
 }

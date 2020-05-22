@@ -7,14 +7,19 @@ import (
 	"github.com/libopenstorage/cloudops"
 	"github.com/libopenstorage/cloudops/test"
 	"github.com/pborman/uuid"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"k8s.io/kubernetes/pkg/cloudprovider/providers/vsphere/vclib"
 )
 
 const (
-	newDiskSizeInKB    = 2097152 // 2GB
-	newDiskPrefix      = "openstorage-test"
-	newDiskDescription = "Disk created by Openstorage tests"
+	newDiskSizeInKB = 2097152 // 2GB
+	newDiskPrefix   = "openstorage-test"
+)
+
+var (
+	datastoreForTest string
+	driver           cloudops.Ops
 )
 
 var diskName = fmt.Sprintf("%s-%s", newDiskPrefix, uuid.New())
@@ -26,18 +31,14 @@ func initVsphere(t *testing.T) (cloudops.Ops, map[string]interface{}) {
 	cfg.VMUUID, err = cloudops.GetEnvValueStrict("VSPHERE_VM_UUID")
 	require.NoError(t, err, "failed to get vsphere config from env variable VSPHERE_VM_UUID")
 
-	datastoreForTest, err := cloudops.GetEnvValueStrict("VSPHERE_TEST_DATASTORE")
+	datastoreForTest, err = cloudops.GetEnvValueStrict("VSPHERE_TEST_DATASTORE")
 	require.NoError(t, err, "failed to get datastore from env variable VSPHERE_TEST_DATASTORE")
 
-	driver, err := NewClient(cfg)
+	driver, err = NewClient(cfg)
 	require.NoError(t, err, "failed to instantiate storage ops driver")
 
-	tags := map[string]string{
-		"foo": "bar",
-	}
 	diskOptions := &vclib.VolumeOptions{
 		Name:       diskName,
-		Tags:       tags,
 		CapacityKB: newDiskSizeInKB,
 		Datastore:  datastoreForTest,
 	}
@@ -83,4 +84,47 @@ func TestDevicePath(t *testing.T) {
 		t.Skip("skipping vSphere device test as environment is not set...")
 	}
 
+}
+
+func TestCreate(t *testing.T) {
+	if IsDevMode() {
+		d, _ := initVsphere(t)
+		require.NotNil(t, d)
+
+		diskOptions := &vclib.VolumeOptions{
+			Name:       diskName,
+			CapacityKB: newDiskSizeInKB,
+			Datastore:  datastoreForTest,
+		}
+
+		disk, err := driver.Create(diskOptions, nil)
+		require.NoError(t, err)
+		require.NotNil(t, disk)
+
+		diskInfo, ok := disk.(*VirtualDisk)
+		require.True(t, ok)
+
+		fmt.Printf("[debug] created disk: %d path: %s datastore: %s\n",
+			diskInfo.VirtualDisk.VolumeOptions.CapacityKB, diskInfo.VirtualDisk.DiskPath, diskInfo.DatastoreRef.String())
+
+		id := diskInfo.VirtualDisk.DiskPath
+		path, err := driver.Attach(id)
+		require.NoError(t, err)
+		require.NotEmpty(t, path)
+		logrus.Infof("attached: %s at %s", id, path)
+
+		path, err = driver.DevicePath(id)
+		require.NoError(t, err)
+		require.NotEmpty(t, path)
+		logrus.Infof("device path: %s at %s", id, path)
+
+		//err = driver.Detach(diskInfo.VirtualDisk.DiskPath)
+		//require.NoError(t, err)
+		//
+		//err = driver.Delete(diskInfo.VirtualDisk.DiskPath)
+		//require.NoError(t, err)
+	} else {
+		fmt.Printf("skipping vSphere tests as environment is not set...\n")
+		t.Skip("skipping vSphere tests as environment is not set...")
+	}
 }

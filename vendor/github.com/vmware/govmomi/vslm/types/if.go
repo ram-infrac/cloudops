@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2015 VMware, Inc. All Rights Reserved.
+Copyright (c) 2014-2018 VMware, Inc. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,18 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package object
+package types
 
 import (
-	"context"
+	"reflect"
 
 	"github.com/vmware/govmomi/vim25/types"
 )
 
-// The NetworkReference interface is implemented by managed objects
-// which can be used as the backing for a VirtualEthernetCard.
-type NetworkReference interface {
-	Reference
-	GetInventoryPath() string
-	EthernetCardBackingInfo(ctx context.Context) (types.BaseVirtualDeviceBackingInfo, error)
+func (b *VslmFault) GetVslmFault() *VslmFault { return b }
+
+type BaseVslmFault interface {
+	GetVslmFault() *VslmFault
+}
+
+func init() {
+	types.Add("BaseVslmFault", reflect.TypeOf((*VslmFault)(nil)).Elem())
+}
+
+func (b *VslmTaskReason) GetVslmTaskReason() *VslmTaskReason { return b }
+
+type BaseVslmTaskReason interface {
+	GetVslmTaskReason() *VslmTaskReason
+}
+
+func init() {
+	types.Add("BaseVslmTaskReason", reflect.TypeOf((*VslmTaskReason)(nil)).Elem())
 }
